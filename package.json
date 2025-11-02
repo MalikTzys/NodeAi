@@ -1,0 +1,16 @@
+{
+  "name": "nodeai",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "ai.js",
+  "scripts": {
+    "test": "node irix.js"
+  },
+  "keywords": [],
+  "author": "Malik Hanafi",
+  "license": "ISC",
+  "description": "Membuat sebuah bot discord menggunakan CharacterAi untuk membuat server discord lebih seru dan menyenangkan.",
+  "dependencies": {
+    "node_characterai": "^1.2.5"
+  }
+}
