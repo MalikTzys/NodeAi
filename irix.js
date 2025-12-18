@@ -1,26 +1,21 @@
 import { Client, GatewayIntentBits, EmbedBuilder } from 'discord.js';
 import { CAINode } from 'cainode';
 
+// ============ KONFIGURASI ============
 const CONFIG = {
-  DISCORD_TOKEN: 'DISCORD_BOT_TOKEN',
-  CAI_TOKEN: 'HTTP_TOKEN',
-  CHARACTER_ID: 'CHAR_ID',
-  PREFIX: '??',
+  DISCORD_TOKEN: 'YOUR_DISCORD_TOKEN',
+  CAI_TOKEN: 'YOUR_HTTP_TOKEN',
+  CHARACTER_ID: 'YOUT_CHARACTER_ID',
+  PREFIX: '???',
   CHANNEL_IDS: [],
   TYPING_INDICATOR: true,
   MAX_MESSAGE_LENGTH: 2000,
-  AUTO_REPLY_GREETINGS: true,
-  GREETING_KEYWORDS: [
-    'halo', 'hai', 'hey', 'hi', 'hello',
-    'selamat pagi', 'pagi', 'good morning', 'morning',
-    'selamat siang', 'siang', 'good afternoon', 'afternoon',
-    'selamat sore', 'sore', 'good evening', 'evening',
-    'selamat malam', 'malam', 'good night', 'night',
-    'apa kabar', 'how are you', 'how r u',
-    'p', 'ping', 'bot', 'ada', 'haloo', 'halloo',
-  ],
+  AUTO_RESET_HOURS: [0, 12], // Reset di jam 00:00 dan 12:00 WIB
+  AUTO_RECONNECT_INTERVAL: 30000, // Cek koneksi setiap 30 detik
+  MAX_RECONNECT_ATTEMPTS: 10, // Maksimal percobaan reconnect berturut-turut
 };
 
+// ============ INISIALISASI ============
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -34,17 +29,25 @@ const cai = new CAINode();
 let isAuthenticated = false;
 let isConnected = false;
 let characterInfo = null;
+let reconnectAttempts = 0;
+let isReconnecting = false;
+let lastResetDate = new Date().toDateString();
+let lastResetHour = -1;
 
+// ============ FUNGSI HELPER ============
+
+// Autentikasi ke Xeno
 async function authenticateCAI() {
   try {
-    console.log('🔐 Mencoba login ke server Character.Ai...');
+    console.log('🔐 Mencoba login ke Xeno...');
     await cai.login(CONFIG.CAI_TOKEN);
-    console.log('✅ Berhasil login ke server Character.Ai');
+    console.log('✅ Berhasil login ke Xeno');
     isAuthenticated = true;
     
     characterInfo = {
-      participant__name: 'Character.Ai Server',
-      title: 'Bot'
+      participant__name: 'Xeno Server',
+      title: 'Character Server',
+      description: 'Xeno Integration'
     };
     
     try {
@@ -54,12 +57,13 @@ async function authenticateCAI() {
         console.log(`✅ Character loaded: ${characterInfo.participant__name}`);
       }
     } catch (charError) {
-      console.log('ℹ️ Menggunakan default character info');
+      console.log('ℹ️ Menggunakan default character info (API mungkin limited)');
     }
     
     try {
       await cai.character.connect(CONFIG.CHARACTER_ID);
       isConnected = true;
+      reconnectAttempts = 0;
       console.log('✅ Connected ke character chat');
     } catch (connectError) {
       console.error('⚠️ Gagal connect ke character:', connectError.message);
@@ -68,29 +72,136 @@ async function authenticateCAI() {
     return true;
   } catch (error) {
     console.error('❌ Gagal autentikasi:', error.message);
+    console.error('Token mungkin expired atau invalid. Silakan dapatkan token baru!');
     return false;
   }
 }
 
+// Auto reconnect function
+async function attemptReconnect() {
+  if (isReconnecting || !isAuthenticated) return;
+  
+  isReconnecting = true;
+  reconnectAttempts++;
+  
+  console.log(`🔄 Percobaan reconnect ke-${reconnectAttempts}...`);
+  
+  try {
+    if (isConnected) {
+      try {
+        await cai.character.disconnect();
+      } catch (e) {
+        console.log('ℹ️ Disconnect sebelum reconnect gagal (mungkin sudah terputus)');
+      }
+      isConnected = false;
+    }
+    
+    await cai.character.connect(CONFIG.CHARACTER_ID);
+    isConnected = true;
+    reconnectAttempts = 0;
+    console.log('✅ Reconnect berhasil!');
+    
+    // Update presence
+    if (characterInfo) {
+      client.user.setPresence({
+        activities: [{ name: `${characterInfo.participant__name || characterInfo.title}`, type: 0 }],
+        status: 'online'
+      });
+    }
+  } catch (error) {
+    console.error(`❌ Reconnect gagal (percobaan ${reconnectAttempts}):`, error.message);
+    
+    if (reconnectAttempts >= CONFIG.MAX_RECONNECT_ATTEMPTS) {
+      console.error('⚠️ Maksimal percobaan reconnect tercapai, akan coba autentikasi ulang...');
+      reconnectAttempts = 0;
+      
+      try {
+        await authenticateCAI();
+      } catch (authError) {
+        console.error('❌ Autentikasi ulang gagal:', authError.message);
+      }
+    }
+  } finally {
+    isReconnecting = false;
+  }
+}
+
+// Cek dan auto reconnect jika terputus
+async function checkConnectionHealth() {
+  if (!isAuthenticated) {
+    console.log('⚠️ Belum terotentikasi, mencoba login...');
+    await authenticateCAI();
+    return;
+  }
+  
+  if (!isConnected && !isReconnecting) {
+    console.log('⚠️ Koneksi terputus, mencoba reconnect...');
+    await attemptReconnect();
+  }
+}
+
+// Auto reset conversation di jam tertentu
+async function checkAutoReset() {
+  const now = new Date();
+  const wibOffset = 7 * 60; // WIB = UTC+7
+  const wibTime = new Date(now.getTime() + wibOffset * 60 * 1000);
+  
+  const currentHour = wibTime.getUTCHours();
+  const currentDate = wibTime.toDateString();
+  
+  // Cek apakah sudah ganti hari
+  if (currentDate !== lastResetDate) {
+    lastResetDate = currentDate;
+    lastResetHour = -1;
+  }
+  
+  // Cek apakah jam reset dan belum direset di jam ini
+  if (CONFIG.AUTO_RESET_HOURS.includes(currentHour) && lastResetHour !== currentHour) {
+    console.log(`⏰ Auto reset conversation di jam ${currentHour}:00 WIB`);
+    
+    try {
+      if (isConnected) {
+        await cai.character.create_new_conversation(true);
+        lastResetHour = currentHour;
+        console.log(`✅ Auto reset berhasil di ${wibTime.toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}`);
+      } else {
+        console.log('⚠️ Skip auto reset karena tidak terkoneksi');
+      }
+    } catch (error) {
+      console.error('❌ Auto reset gagal:', error.message);
+    }
+  }
+}
+
+// Kirim pesan ke Xeno dengan auto-reconnect
 async function sendToCharacterAI(message) {
   try {
-    console.log('📤 Mengirim pesan ke server Character.Ai...');
+    console.log('📤 Mengirim pesan ke Xeno...');
+    
     const response = await cai.character.send_message(message, false);
     
     if (response && response.turn && response.turn.author) {
       const replies = response.turn.candidates || [];
       if (replies.length > 0) {
+        reconnectAttempts = 0; // Reset counter jika sukses
         return replies[0].raw_content || '[Tidak ada respons]';
       }
     }
     
-    throw new Error('Response tidak valid dari server Character.Ai');
+    throw new Error('Response tidak valid dari Xeno');
+    
   } catch (error) {
     console.error('❌ Error saat mengirim pesan:', error.message);
+    
+    // Jika error, tandai sebagai disconnected dan coba reconnect
+    isConnected = false;
+    console.log('⚠️ Menandai sebagai disconnected, akan auto-reconnect...');
+    
     throw error;
   }
 }
 
+// Split pesan panjang
 function splitMessage(text, maxLength = CONFIG.MAX_MESSAGE_LENGTH) {
   if (!text) return ['[Tidak ada respons]'];
   
@@ -111,18 +222,7 @@ function splitMessage(text, maxLength = CONFIG.MAX_MESSAGE_LENGTH) {
   return messages.length > 0 ? messages : ['[Tidak ada respons]'];
 }
 
-function isGreeting(message) {
-  if (!CONFIG.AUTO_REPLY_GREETINGS) return false;
-  
-  const content = message.content.toLowerCase().trim();
-  if (content.length > 50) return false;
-  
-  return CONFIG.GREETING_KEYWORDS.some(keyword => {
-    const regex = new RegExp(`\\b${keyword}\\b`, 'i');
-    return regex.test(content);
-  });
-}
-
+// Cek apakah pesan untuk Server
 function shouldRespond(message) {
   if (message.author.bot) return false;
 
@@ -132,13 +232,14 @@ function shouldRespond(message) {
 
   const isMentioned = message.mentions.has(client.user);
   const isDM = message.channel.type === 1;
-  const isGreetingMsg = isGreeting(message);
 
-  return isMentioned || isDM || isGreetingMsg;
+  return isMentioned || isDM;
 }
 
+// Ekstrak pesan (hapus mention)
 function extractMessage(message) {
   let content = message.content;
+  
   content = content.replace(/<@!?\d+>/g, '').trim();
   
   if (content.startsWith(CONFIG.PREFIX)) {
@@ -148,13 +249,16 @@ function extractMessage(message) {
   return content;
 }
 
-client.once('clientReady', async () => {
-  console.log(`🤖 Bot Discord siap: ${client.user.tag}`);
+// ============ EVENT HANDLERS ============
+
+client.once('ready', async () => {
+  console.log(`🤖 Server Discord siap: ${client.user.tag}`);
   
   const loginSuccess = await authenticateCAI();
   
   if (!loginSuccess) {
-    console.error('⚠️ Bot tidak bisa chat dengan server');
+    console.error('⚠️ Server tidak bisa chat dengan Xeno');
+    console.error('Silakan cek token dan restart Server');
   }
   
   if (isAuthenticated && characterInfo) {
@@ -163,13 +267,25 @@ client.once('clientReady', async () => {
       status: 'online'
     });
   }
+  
+  // Start auto reconnect checker
+  setInterval(checkConnectionHealth, CONFIG.AUTO_RECONNECT_INTERVAL);
+  console.log(`🔄 Auto-reconnect checker dimulai (interval: ${CONFIG.AUTO_RECONNECT_INTERVAL/1000}s)`);
+  
+  // Start auto reset checker (cek setiap 1 menit)
+  setInterval(checkAutoReset, 60000);
+  console.log(`⏰ Auto-reset checker dimulai (reset jam: ${CONFIG.AUTO_RESET_HOURS.join(', ')} WIB)`);
 });
 
 client.on('messageCreate', async (message) => {
   if (!shouldRespond(message)) return;
   
-  if (!isAuthenticated || !isConnected) {
-    return message.reply('❌ Bot belum siap. Tunggu sebentar atau hubungi admin.');
+  if (!isAuthenticated) {
+    return message.reply('❌ Server belum terotentikasi. Menunggu login...');
+  }
+  
+  if (!isConnected) {
+    return message.reply('⚠️ Server sedang reconnect... Tunggu sebentar ya!');
   }
 
   const userMessage = extractMessage(message);
@@ -178,12 +294,7 @@ client.on('messageCreate', async (message) => {
     return message.reply(`Hai! Mention aku atau kirim DM untuk ngobrol dengan **${charName}**!`);
   }
 
-  const isMentioned = message.mentions.has(client.user);
-  const isDM = message.channel.type === 1;
-  const isGreetingMsg = isGreeting(message);
-  
-  const interactionType = isDM ? 'DM' : isMentioned ? 'MENTION' : isGreetingMsg ? 'GREETING' : 'UNKNOWN';
-  console.log(`💬 [${interactionType}] [${message.author.tag}]: ${userMessage}`);
+  console.log(`💬 [${message.author.tag}]: ${userMessage}`);
 
   if (CONFIG.TYPING_INDICATOR) {
     await message.channel.sendTyping();
@@ -207,29 +318,30 @@ client.on('messageCreate', async (message) => {
     const errorEmbed = new EmbedBuilder()
       .setColor('#ff0000')
       .setTitle('❌ Error')
-      .setDescription('Maaf, terjadi kesalahan saat memproses pesan kamu.')
+      .setDescription('Maaf, terjadi kesalahan. Server akan mencoba reconnect otomatis.')
       .addFields({ 
         name: 'Error Details', 
         value: error.message.substring(0, 1000) 
       })
-      .setFooter({ text: 'Coba lagi atau gunakan ??reconnect' })
+      .setFooter({ text: 'Auto-reconnect aktif' })
       .setTimestamp();
     
     await message.reply({ embeds: [errorEmbed] });
   }
 });
 
+// Command: Reset conversation (manual)
 client.on('messageCreate', async (message) => {
   const content = message.content.toLowerCase();
   if (content === `${CONFIG.PREFIX}reset` || content === `<@${client.user.id}> reset`) {
     if (!isConnected) {
-      return message.reply('❌ Bot belum terkoneksi ke character.');
+      return message.reply('❌ Server belum terkoneksi ke character.');
     }
     
     try {
       await cai.character.create_new_conversation(true);
       await message.reply('✅ Conversation baru berhasil dibuat! Chat history sebelumnya sudah disimpan.');
-      console.log(`🔄 Conversation reset oleh: ${message.author.tag}`);
+      console.log(`🔄 Conversation reset manual oleh: ${message.author.tag}`);
     } catch (error) {
       console.error('❌ Gagal reset conversation:', error);
       await message.reply('❌ Gagal reset conversation: ' + error.message);
@@ -237,26 +349,24 @@ client.on('messageCreate', async (message) => {
   }
 });
 
+// Command: Reconnect (manual)
 client.on('messageCreate', async (message) => {
   const content = message.content.toLowerCase();
   if (content === `${CONFIG.PREFIX}reconnect` || content === `<@${client.user.id}> reconnect`) {
     await message.reply('🔄 Mencoba reconnect...');
     
-    try {
-      if (isConnected) {
-        await cai.character.disconnect();
-      }
-      await cai.character.connect(CONFIG.CHARACTER_ID);
-      isConnected = true;
+    await attemptReconnect();
+    
+    if (isConnected) {
       await message.reply('✅ Berhasil reconnect ke character!');
-      console.log(`🔄 Reconnect oleh: ${message.author.tag}`);
-    } catch (error) {
-      console.error('❌ Gagal reconnect:', error);
-      await message.reply('❌ Gagal reconnect: ' + error.message);
+      console.log(`🔄 Reconnect manual oleh: ${message.author.tag}`);
+    } else {
+      await message.reply('❌ Reconnect gagal, akan dicoba otomatis dalam beberapa saat.');
     }
   }
 });
 
+// Command: Info
 client.on('messageCreate', async (message) => {
   const content = message.content.toLowerCase();
   if (content === `${CONFIG.PREFIX}info` || content === `<@${client.user.id}> info`) {
@@ -267,15 +377,23 @@ client.on('messageCreate', async (message) => {
     const charName = characterInfo.participant__name || characterInfo.title || 'Unknown';
     const charDesc = characterInfo.description || characterInfo.greeting || 'Tidak ada deskripsi';
     
+    const now = new Date();
+    const wibOffset = 7 * 60;
+    const wibTime = new Date(now.getTime() + wibOffset * 60 * 1000);
+    const nextResetHours = CONFIG.AUTO_RESET_HOURS.filter(h => h > wibTime.getUTCHours());
+    const nextReset = nextResetHours.length > 0 ? nextResetHours[0] : CONFIG.AUTO_RESET_HOURS[0];
+    
     const embed = new EmbedBuilder()
       .setColor('#0099ff')
       .setTitle(`🤖 ${charName}`)
       .setDescription(charDesc.substring(0, 4000))
       .addFields(
-        { name: '🤖 Status', value: isConnected ? '✅ Connected' : '❌ Disconnected', inline: true },
-        { name: '🔑 Character ID', value: CONFIG.CHARACTER_ID.substring(0, 20) + '...', inline: true },
+        { name: '🤖 Status', value: isConnected ? '✅ Connected' : '⚠️ Reconnecting...', inline: true },
+        { name: '🔄 Auto-Reconnect', value: '✅ Aktif', inline: true },
+        { name: '⏰ Next Reset', value: `${String(nextReset).padStart(2, '0')}:00 WIB`, inline: true },
+        { name: '🔑 Character ID', value: CONFIG.CHARACTER_ID.substring(0, 20) + '...', inline: false },
       )
-      .setFooter({ text: 'server Character.Ai Integration' })
+      .setFooter({ text: 'Xeno Integration with Auto-Reset & Reconnect' })
       .setTimestamp();
     
     if (characterInfo.avatar_file_name) {
@@ -286,16 +404,18 @@ client.on('messageCreate', async (message) => {
   }
 });
 
+// Command: Ping
 client.on('messageCreate', async (message) => {
   const content = message.content.toLowerCase();
   if (content === `${CONFIG.PREFIX}ping` || content === `<@${client.user.id}> ping`) {
     const embed = new EmbedBuilder()
-      .setColor(isConnected ? '#00ff00' : '#ff0000')
+      .setColor(isConnected ? '#00ff00' : '#ff9900')
       .setTitle('🏓 Pong!')
       .addFields(
         { name: '⏱️ Latency', value: `${Date.now() - message.createdTimestamp}ms`, inline: true },
         { name: '🌐 API Latency', value: `${Math.round(client.ws.ping)}ms`, inline: true },
-        { name: '🤖 CAI Status', value: isConnected ? '✅ Connected' : '❌ Disconnected', inline: true },
+        { name: '🤖 CAI Status', value: isConnected ? '✅ Connected' : '⚠️ Reconnecting', inline: true },
+        { name: '🔄 Reconnect Attempts', value: `${reconnectAttempts}/${CONFIG.MAX_RECONNECT_ATTEMPTS}`, inline: true },
       )
       .setTimestamp();
     
@@ -303,58 +423,33 @@ client.on('messageCreate', async (message) => {
   }
 });
 
+// Command: Help
 client.on('messageCreate', async (message) => {
   const content = message.content.toLowerCase();
   if (content === `${CONFIG.PREFIX}help` || content === `<@${client.user.id}> help`) {
-    const charName = characterInfo?.participant__name || characterInfo?.title || 'Character';
-    
     const embed = new EmbedBuilder()
       .setColor('#0099ff')
       .setTitle('📚 Command List')
-      .setDescription(`Bot ini terintegrasi dengan **${charName}** dari Character.AI`)
+      .setDescription('Berikut adalah command yang tersedia:')
       .addFields(
-        { 
-          name: '💬 Cara Chat', 
-          value: '**Sapaan:** Kirim sapaan seperti "halo", "pagi", dll (otomatis reply)\n**Chat biasa:** Mention bot `@' + client.user.username + '` atau kirim DM', 
-          inline: false 
-        },
-        { name: `${CONFIG.PREFIX}ping`, value: 'Cek status & latency bot', inline: true },
-        { name: `${CONFIG.PREFIX}info`, value: 'Lihat info character', inline: true },
-        { name: `${CONFIG.PREFIX}reset`, value: 'Buat conversation baru', inline: true },
-        { name: `${CONFIG.PREFIX}reconnect`, value: 'Reconnect ke character', inline: true },
-        { name: `${CONFIG.PREFIX}toggle`, value: 'Toggle auto-reply sapaan', inline: true },
+        { name: '💬 Chat', value: `Mention Server atau kirim DM untuk chat dengan character`, inline: false },
+        { name: `${CONFIG.PREFIX}ping`, value: 'Cek status & latency Server', inline: true },
+        { name: `${CONFIG.PREFIX}info`, value: 'Lihat info character & sistem', inline: true },
+        { name: `${CONFIG.PREFIX}reset`, value: 'Buat conversation baru (manual)', inline: true },
+        { name: `${CONFIG.PREFIX}reconnect`, value: 'Reconnect ke character (manual)', inline: true },
         { name: `${CONFIG.PREFIX}help`, value: 'Tampilkan help ini', inline: true },
       )
-      .setFooter({ text: 'server Character.Ai Discord Bot' })
+      .addFields(
+        { name: '🔄 Auto Features', value: '• Auto-Reconnect: Aktif setiap 30 detik\n• Auto-Reset: Setiap jam 00:00 & 12:00 WIB', inline: false }
+      )
+      .setFooter({ text: 'Xeno Discord Bot v2.0' })
       .setTimestamp();
     
     await message.reply({ embeds: [embed] });
   }
 });
 
-client.on('messageCreate', async (message) => {
-  const content = message.content.toLowerCase();
-  if (content === `${CONFIG.PREFIX}toggle` || content === `<@${client.user.id}> toggle`) {
-    CONFIG.AUTO_REPLY_GREETINGS = !CONFIG.AUTO_REPLY_GREETINGS;
-    
-    const status = CONFIG.AUTO_REPLY_GREETINGS ? '✅ AKTIF' : '❌ NONAKTIF';
-    const embed = new EmbedBuilder()
-      .setColor(CONFIG.AUTO_REPLY_GREETINGS ? '#00ff00' : '#ff0000')
-      .setTitle('🔄 Auto-Reply Sapaan')
-      .setDescription(`Auto-reply untuk sapaan sekarang: **${status}**`)
-      .addFields({
-        name: 'ℹ️ Info',
-        value: CONFIG.AUTO_REPLY_GREETINGS 
-          ? 'Bot akan otomatis reply sapaan seperti "halo", "pagi", dll tanpa perlu mention'
-          : 'Bot hanya akan reply jika di-mention atau DM'
-      })
-      .setTimestamp();
-    
-    await message.reply({ embeds: [embed] });
-    console.log(`🔄 Auto-reply greetings ${status} oleh: ${message.author.tag}`);
-  }
-});
-
+// Error handling
 client.on('error', (error) => {
   console.error('❌ Discord client error:', error);
 });
@@ -366,15 +461,24 @@ process.on('unhandledRejection', (error) => {
 process.on('SIGINT', async () => {
   console.log('\n👋 Shutting down...');
   if (isConnected) {
-    await cai.character.disconnect();
+    try {
+      await cai.character.disconnect();
+    } catch (e) {
+      console.log('ℹ️ Disconnect error saat shutdown (diabaikan)');
+    }
   }
   if (isAuthenticated) {
-    await cai.logout();
+    try {
+      await cai.logout();
+    } catch (e) {
+      console.log('ℹ️ Logout error saat shutdown (diabaikan)');
+    }
   }
   process.exit(0);
 });
 
-console.log('🚀 Starting bot...');
+// ============ START Server ============
+console.log('🚀 Starting Server...');
 client.login(CONFIG.DISCORD_TOKEN).catch((error) => {
   console.error('❌ Gagal login ke Discord:', error);
   process.exit(1);
